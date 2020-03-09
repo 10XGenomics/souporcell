@@ -182,31 +182,24 @@ def make_fastqs(args):
     return all_fastqs
 
 def remap(args, all_fastqs):
-    # run minimap2
 
-    print("indexing genome for minimap2")
-    minimap_index = args.out_dir + "/minimap_index.mmi"
-    subprocess.check_call(["minimap2", "-ax", "splice", "-sr", "-k", "21", "-w", "11", "-d", minimap_index, args.fasta])
-
-    #merged_fq_fn = args.out_dir + "/merged.fastq"
-    #with open(merged_fq_fn, "w") as merged_fq:
-    #    subprocess.check_call(["cat"] + all_fastqs, stdout = merged_fq)
-
+    # make a fifo that all the reads will stream through
     fifo = args.out_dir + "/fasta.fifo"
     subprocess.check_call(["mkfifo", fifo])
 
     # Stream data to fifo
     fifo_proc = subprocess.Popen("cat " + " ".join(all_fastqs) + " > " + fifo, shell=True)
 
+    samtools_threads = round(2 * args.threads / 16)
+    minimap_threads = args.threads - samtools_threads
 
-    samtools_threads = 3
-
+    # run minimap2
     print("remapping with minimap2")
     with open(args.out_dir + "/minimap.err",'w') as minierr:
         minierr.write("mapping\n")
-        cmd = ["minimap2", "-ax", "splice", "-t", str(args.threads), "-G50k", "-k", "21",
+        cmd = ["minimap2", "-ax", "splice", "-t", str(minimap_threads), "-G50k", "-k", "21",
                "-w", "11", "--sr", "-A2", "-B8", "-O12,32", "-E2,1", "-r200", "-p.5", "-N20", "-f1000,5000",
-               "-y", "-n2", "-m20", "-s40", "-g2000", "-2K50m", "--secondary=no", minimap_index, fifo]
+               "-y", "-n2", "-m20", "-s40", "-g2000", "-2K50m", "--secondary=no", args.fasta, fifo]
         minierr.write(" ".join(cmd)+"\n")
         minimap_ps = subprocess.Popen(cmd, stdout = subprocess.PIPE, stderr = minierr)
         output = args.out_dir + "/souporcell_minimap.bam"
