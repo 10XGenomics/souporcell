@@ -50,10 +50,9 @@ with open(args.out,'w') as fastq:
         #            keys_to_remove.append(key)
         #    for key in keys_to_remove:
         #        del recent_umis[key]
-    
         readname = read.qname
         if read.has_tag("CB") and read.get_tag("CB") in cell_barcodes:
-            fastq.write("@"+read.qname+";"+cell_barcode+";"+UMI+"\n")
+            fastq.write("@" + read.qname + " CB:Z:" + cell_barcode + "\tUB:Z:" + UMI + "\n")
             fastq.write(read.seq+"\n")
             fastq.write("+\n")
             fastq.write(read.qual+"\n")
