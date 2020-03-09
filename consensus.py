@@ -10,9 +10,13 @@ parser.add_argument("-r","--ref_matrix",required=True,help="ref matrix file")
 parser.add_argument("-p","--ploidy",required=False, help="ploidy, must be 1 or 2, defaults to 2")
 parser.add_argument("--soup_out",required=True, help="soup output")
 parser.add_argument("--vcf_out",required=True, help="vcf output")
+parser.add_argument("--output_dir", required=True, help = "output directory")
 #parser.add_argument("-d","--doublets",required=True, help="doublet calls")
 parser.add_argument("-v","--vcf",required=True,help="vcf file from which alt and ref matrix were created")
 args = parser.parse_args()
+
+
+dirname = args.output_dir
 
 
 def myopen(fname): return open(fname, 'rb') if fname.endswith('.gz') else open(fname)
@@ -359,7 +363,8 @@ import gzip
 vcftemplate = vcf.Reader(myopen(args.vcf))
 vcfreader = vcf.Reader(myopen(args.vcf))
 import math
-with open("tempsouporcell.vcf",'w') as geno:
+tmp_vcf = dirname+"/tempsouporcell.vcf"
+with open(tmp_vcf,'w') as geno:
     vcfwriter = vcf.Writer(geno,vcftemplate)
     samples = [str(cluster) for cluster in range(max_cluster+1)]
     vcfwriter.template.samples = samples
@@ -430,7 +435,7 @@ with open("tempsouporcell.vcf",'w') as geno:
                 calls.append(vcf.model._Call(newrec, str(cluster), CallData(gt, ao, ro, truth, err, go, gn)))
             newrec.samples = calls
             vcfwriter.write_record(newrec)
-with open("tempsouporcell.vcf") as tmp:
+with open(tmp_vcf) as tmp:
     with open(args.vcf_out,'w') as out:
         for line in tmp:
             if line.startswith("#"):
@@ -440,4 +445,4 @@ with open("tempsouporcell.vcf") as tmp:
                     out.write(line)
             else:
                 out.write(line)
-subprocess.check_call(["rm","tempsouporcell.vcf"])
+subprocess.check_call(["rm",tmp_vcf])

@@ -2,6 +2,13 @@
 
 import argparse
 
+import logging
+logging.basicConfig(format='%(asctime)s %(message)s', datefmt='%I:%M:%S %p')
+logging.warning('Starting pipeline')
+
+def print(msg):
+    logging.warning(msg)
+
 parser = argparse.ArgumentParser(
     description="single cell RNAseq mixed genotype clustering using sparse mixture model clustering with tensorflow.")
 parser.add_argument("-i", "--bam", required = True, help = "cellranger bam")
@@ -44,8 +51,8 @@ import vcf
 print("importing pysam")
 import pysam
 
-print("importing pyfasta")
-import pyfasta
+print("importing pyfaidx")
+import pyfaidx
 
 print("importing subprocess")
 import subprocess
@@ -105,7 +112,7 @@ if not args.ignore == "True":
     assert float(num_cb_cb) / float(num_read_test) > 0.05, "Less than 25% of first 100000 reads have cell barcodes from barcodes file, is this the correct barcode file? turn on --ignore True to ignore"
 
 print("checking fasta")
-fasta = pyfasta.Fasta(args.fasta, key_fn = lambda key: key.split()[0])
+fasta = pyfaidx.Fasta(args.fasta, key_function = lambda key: key.split()[0])
 
 def make_fastqs(args):
     if not os.path.isfile(args.bam + ".bai"):
@@ -118,157 +125,108 @@ def make_fastqs(args):
     total_reference_length = 0
     for chrom in bam.references:
         total_reference_length += bam.get_reference_length(chrom)
-    step_length = int(math.ceil(total_reference_length / int(args.threads)))
-    regions = []
+    step_length = int(math.ceil(total_reference_length / (2 * int(args.threads))))
+
     region = []
-    region_so_far = 0
-    chrom_so_far = 0
+
     print("creating chunks")
     for chrom in bam.references:
         chrom_length = bam.get_reference_length(chrom)
-        while True:
-            if region_so_far + (chrom_length - chrom_so_far) <= step_length:
-                region.append((chrom, chrom_so_far, chrom_length))
-                region_so_far += chrom_length - chrom_so_far
-                chrom_so_far = 0
-                break
-            else:
-                region.append((chrom, chrom_so_far, step_length - region_so_far))
-                regions.append(region)
-                region = []
-                chrom_so_far += step_length - region_so_far + 1
-                region_so_far = 0
-    if len(region) > 0:
-        regions.append(region)
+        for i in range(math.ceil(chrom_length / step_length)):
+            start = step_length * i
+            end = min(chrom_length, start + step_length)
+            region.append((chrom, start, end))
 
     # for testing, delete this later
     args.threads = int(args.threads)
-    region_fastqs = [[] for x in range(args.threads)]
     all_fastqs = []
     procs = [None for x in range(args.threads)]
     any_running = True
     # run renamer in parallel manner
+
+    current_region = 0
     print("generating fastqs with cell barcodes and umis in readname")
     while any_running:
         any_running = False
-        for (index, region) in enumerate(regions):
-            block = False
+
+        for index in range(len(procs)):
+            slot_open = True
             if procs[index]:
-                block = procs[index].poll() == None
-                if block:
+                returncode = procs[index].poll()
+                slot_open = returncode is not None
+                if not slot_open:
                     any_running = True
                 else:
-                    assert not(procs[index].returncode), "renamer subprocess terminated abnormally with code " + str(procs[index].returncode)
-            if len(region_fastqs[index]) == len(region) - 1:
-                block = True
-            if not block:
-                sub_index = len(region_fastqs[index])
-                chrom = region[sub_index][0]
-                start = region[sub_index][1]
-                end = region[sub_index][2]
-                fq_name = args.out_dir + "/souporcell_fastq_" + str(index) + "_" + str(sub_index) + ".fq"
+                    assert returncode == 0, "renamer subprocess terminated abnormally with code " + str(returncode)
+
+            if slot_open and current_region < len(region):
+                (chrom, start, end) = region[current_region]
+                fq_name = args.out_dir + "/souporcell_fastq_" + str(current_region) + ".fq"
                 p = subprocess.Popen(["renamer.py", "--bam", args.bam, "--barcodes", args.barcodes, "--out", fq_name,
                         "--chrom", chrom, "--start", str(start), "--end", str(end)])
                 all_fastqs.append(fq_name)
                 procs[index] = p
-                region_fastqs[index].append(fq_name)
                 any_running = True
-        time.sleep(0.5)
-    with open(args.out_dir + "/fastqs.done", 'w') as done:
-        for fastqs in region_fastqs:
-            done.write("\t".join(fastqs) + "\n")
-    return((region_fastqs, all_fastqs))
+                current_region += 1
 
-def remap(args, region_fastqs, all_fastqs):
-    print("remapping with minimap2")
+        if not any_running and current_region == len(region):
+            break
+
+        time.sleep(0.5)
+
+    print("done writing fastqs")
+
+    with open(args.out_dir + "/fastqs.done", 'w') as done:
+        for fastq in all_fastqs:
+            done.write(fastq + "\n")
+    return all_fastqs
+
+def remap(args, all_fastqs):
+
+    # make a fifo that all the reads will stream through
+    fifo = args.out_dir + "/fasta.fifo"
+    subprocess.check_call(["mkfifo", fifo])
+
+    # Stream data to fifo
+    fifo_proc = subprocess.Popen("cat " + " ".join(all_fastqs) + " > " + fifo, shell=True)
+
+    samtools_threads = round(2 * args.threads / 16)
+    minimap_threads = args.threads - samtools_threads
+
     # run minimap2
-    minimap_tmp_files = []
-    for index in range(args.threads):
-        if index > len(region_fastqs) or len(region_fastqs[index]) == 0:
-            continue
-        output = args.out_dir + "/souporcell_minimap_tmp_" + str(index) + ".sam"
-        minimap_tmp_files.append(output)
-        with open(args.out_dir + "/tmp.fq", 'w') as tmpfq:
-            subprocess.check_call(['cat'] + region_fastqs[index], stdout = tmpfq)
-        with open(output, 'w') as samfile:
-            with open(args.out_dir + "/minimap.err",'w') as minierr:
-                minierr.write("mapping\n")
-                #subprocess.check_call(["hisat2", "-p", str(args.threads), "-q", args.out_dir + "/tmp.fq", "-x", 
-                #args.fasta[:-3],
-                #"-S", output], stderr =minierr)
-                cmd = ["minimap2", "-ax", "splice", "-t", str(args.threads), "-G50k", "-k", "21",
-                    "-w", "11", "--sr", "-A2", "-B8", "-O12,32", "-E2,1", "-r200", "-p.5", "-N20", "-f1000,5000",
-                    "-n2", "-m20", "-s40", "-g2000", "-2K50m", "--secondary=no", args.fasta, args.out_dir + "/tmp.fq"]
-                minierr.write(" ".join(cmd)+"\n")
-                subprocess.check_call(["minimap2", "-ax", "splice", "-t", str(args.threads), "-G50k", "-k", "21", 
-                    "-w", "11", "--sr", "-A2", "-B8", "-O12,32", "-E2,1", "-r200", "-p.5", "-N20", "-f1000,5000",
-                    "-n2", "-m20", "-s40", "-g2000", "-2K50m", "--secondary=no", args.fasta, args.out_dir + "/tmp.fq"], 
-                    stdout = samfile, stderr = minierr)
-        subprocess.check_call(['rm', args.out_dir + "/tmp.fq"])
+    print("remapping with minimap2")
+    with open(args.out_dir + "/minimap.err",'w') as minierr:
+        minierr.write("mapping\n")
+        cmd = ["minimap2", "-ax", "splice", "-t", str(minimap_threads), "-G50k", "-k", "21",
+               "-w", "11", "--sr", "-A2", "-B8", "-O12,32", "-E2,1", "-r200", "-p.5", "-N20", "-f1000,5000",
+               "-y", "-n2", "-m20", "-s40", "-g2000", "-2K50m", "--secondary=no", args.fasta, fifo]
+        minierr.write(" ".join(cmd)+"\n")
+        minimap_ps = subprocess.Popen(cmd, stdout = subprocess.PIPE, stderr = minierr)
+        output = args.out_dir + "/souporcell_minimap.bam"
+        subprocess.check_call(["samtools", "view", "-b", "-@", str(samtools_threads), "-o", output, "-"], stdin=minimap_ps.stdout, stderr = minierr)
 
     with open(args.out_dir + '/remapping.done', 'w') as done:
-        for fn in minimap_tmp_files:
-            done.write(fn + "\n")
-    print("cleaning up tmp fastqs")
-    # clean up tmp fastqs
+            done.write(output + "\n")
+
+    # clean up tmp files
     for fq in all_fastqs:
         subprocess.check_call(["rm", fq])
-    return(minimap_tmp_files)
+    subprocess.check_call(["rm", fifo])
 
-def retag(args, minimap_tmp_files):
-    print("repopulating cell barcode and UMI tags")
-    # run retagger
-    procs = []
-    retag_files = []
-    for index in range(args.threads):
-        if index > len(minimap_tmp_files) -1:
-            continue
-        outfile = args.out_dir + "/souporcell_retag_tmp_" + str(index) + ".bam"
-        retag_files.append(outfile)
-        p = subprocess.Popen(["retag.py", "--sam", minimap_tmp_files[index], "--out", outfile])
-        procs.append(p)
-    for p in procs: # wait for processes to finish
-        p.wait()
-        assert not(p.returncode), "retag subprocess ended abnormally with code " + str(p.returncode)
+    return output
 
+def sort(args, minimap_tmp_file):
 
-    print("sorting retagged bam files")
-    # sort retagged files
-    sort_jobs = []
-    filenames = []
-    with open(args.out_dir + "/retag.err", 'w') as retagerr:
-        for index in range(args.threads):
-            if index > len(retag_files) - 1:
-                continue
-            filename = args.out_dir + "/souporcell_retag_sorted_tmp_" + str(index) + ".bam"
-            filenames.append(filename)
-            p = subprocess.Popen(["samtools", "sort", retag_files[index], '-o', filename], stderr = retagerr)
-            sort_jobs.append(p)
-        
-    # wait for jobs to finish
-    for job in sort_jobs:
-        job.wait()
-        assert not(job.returncode), "samtools sort ended abnormally with code " + str(job.returncode)
-
-    #clean up unsorted bams
-    for bam in retag_files:
-        subprocess.check_call(["rm", bam])
-
-    print("merging sorted bams")
+    print("sorting bam")
     final_bam = args.out_dir + "/souporcell_minimap_tagged_sorted.bam"
-    subprocess.check_call(["samtools", "merge", final_bam] + filenames)
 
-    subprocess.check_call(["samtools", "index", final_bam])
-    
-    print("cleaning up tmp samfiles")
-    # clean up tmp samfiles
-    for samfile in minimap_tmp_files:
-        subprocess.check_call(["rm", samfile])
+    subprocess.check_call(["samtools", "sort", "-@", str(args.threads), "--write-index", "-o", final_bam,  minimap_tmp_file])
 
     # clean up tmp bams
-    for filename in filenames:
-        subprocess.check_call(['rm', filename])
+    subprocess.check_call(['rm', minimap_tmp_file])
     subprocess.check_call(["touch", args.out_dir + "/retagging.done"])
+
+    return final_bam
 
 def freebayes(args, bam, fasta):
     total_reference_length = 0
@@ -451,7 +409,7 @@ def doublets(args, ref_mtx, alt_mtx, cluster_file):
 def consensus(args, ref_mtx, alt_mtx, doublet_file):
     print("running co inference of ambient RNA and cluster genotypes")
     subprocess.check_call(["consensus.py", "-c", doublet_file, "-a", alt_mtx, "-r", ref_mtx, "-p", args.ploidy,
-        "--soup_out", args.out_dir + "/ambient_rna.txt", "--vcf_out", args.out_dir + "/cluster_genotypes.vcf", "--vcf", final_vcf])
+        "--output_dir",args.out_dir,"--soup_out", args.out_dir + "/ambient_rna.txt", "--vcf_out", args.out_dir + "/cluster_genotypes.vcf", "--vcf", final_vcf])
     subprocess.check_call(['touch', args.out_dir + "/consensus.done"])
 
 
@@ -463,26 +421,20 @@ else:
     subprocess.check_call(["mkdir", args.out_dir])
 if not args.skip_remap:
     if not os.path.exists(args.out_dir + "/fastqs.done"):
-        (region_fastqs, all_fastqs) = make_fastqs(args)
+        all_fastqs = make_fastqs(args)
     else:
         all_fastqs = []
-        region_fastqs = []
         with open(args.out_dir + "/fastqs.done") as fastqs:
             for line in fastqs:
-                toks = line.strip().split("\t")
-                region_fastqs.append(toks)
-                for tok in toks:
-                    all_fastqs.append(tok)
+                all_fastqs.append(line.strip())
     if not os.path.exists(args.out_dir + "/remapping.done"):
-        minimap_tmp_files = remap(args, region_fastqs, all_fastqs)
+        minimap_tmp_file = remap(args, all_fastqs)
     else:
-        minimap_tmp_files = []
-        with open(args.out_dir + "/remapping.done") as bams:
-            for line in bams:
-                minimap_tmp_files.append(line.strip())
-    if not os.path.exists(args.out_dir + "/retagging.done"):
-        retag(args, minimap_tmp_files)
-    bam = args.out_dir + "/souporcell_minimap_tagged_sorted.bam" 
+        with open(args.out_dir + "/remapping.done") as bam:
+            minimap_tmp_file = bam.readline().strip()
+    if not os.path.exists(args.out_dir + "/sorting.done"):
+        sort(args, minimap_tmp_file)
+    bam = args.out_dir + "/souporcell_minimap_tagged_sorted.bam"
 else:
     bam = args.bam
 if not os.path.exists(args.out_dir + "/variants.done"):
