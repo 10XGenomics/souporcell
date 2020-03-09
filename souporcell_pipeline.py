@@ -212,7 +212,6 @@ def remap(args, all_fastqs):
     for fq in all_fastqs:
         subprocess.check_call(["rm", fq])
     subprocess.check_call(["rm", fifo])
-    subprocess.check_call(["rm", minimap_index])
 
     return output
 
